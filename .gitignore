@@ -1,0 +1,4 @@
+*.npz
+*.wav
+*.txt
+record/*
