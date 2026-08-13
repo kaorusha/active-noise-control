@@ -57,7 +57,15 @@ def setup_acoustic_paths(sz_file_path: str = None, target_taps: int = 64):
     S_hat = S.copy() 
     return P, S, S_hat
     
-def run_fxnlms(x: np.ndarray, d: np.ndarray, S: np.ndarray, S_hat: np.ndarray, F_hat: np.ndarray, mu: float = 0.1, filter_length: int = 64):
+def run_fxnlms(x: np.ndarray, 
+               d: np.ndarray, 
+               S: np.ndarray, 
+               S_hat: np.ndarray, 
+               F_hat: np.ndarray, 
+               mu: float = 0.1, 
+               filter_length: int = 64, 
+               leak: float = 1e-5
+               ):
     """
     執行具備聲學回授中和(Feedback Neutralization) 的 FxNLMS 離線演算法模擬
     Args:
@@ -68,6 +76,7 @@ def run_fxnlms(x: np.ndarray, d: np.ndarray, S: np.ndarray, S_hat: np.ndarray, F
         F_hat (array): 回授路徑估測脈衝響應 Estimated Feedback Path
         mu (float): 學習率
         filter_length (int): 濾波器長度
+        leak (float): 權重衰減因子
     Returns:
         tuple: (e, y, w, x_net)
             - e (array): 殘留噪音
@@ -133,7 +142,7 @@ def run_fxnlms(x: np.ndarray, d: np.ndarray, S: np.ndarray, S_hat: np.ndarray, F
         
         # 使用正規化公式更新權重
         # w = w - mu * e[i] * x_prime_history
-        w = w - (mu / (power + epsilon)) * e[i] * x_prime_history
+        w = w * (1 - leak) - (mu / (power + epsilon)) * e[i] * x_prime_history
 
     # 計算收斂後的降噪量
     d_power = np.mean(d[-10000:]**2)  # 取最後 10000 個樣本的平均功率
@@ -221,9 +230,9 @@ def convert_fir_to_biquad(w_fir: np.ndarray, eval_point:int = 2048, original_fs:
     h_target = h_target_aligned[valid_idx]
 
     # 3. 建立權重遮罩，只針對基頻和倍頻
-    weight_mask = np.ones_like(target_freqs) * 0.1  # 預設低權重
+    weight_mask = np.ones_like(target_freqs) * 0.01  # 預設低權重
     
-    harmonic_freqs = [3600, 7200, 10800]  # 假設主要噪音源的基頻與倍頻
+    harmonic_freqs = [600, 3600]  # 假設主要噪音源的基頻與倍頻
     bandwidth = 150  # 每個頻段的寬度
 
     for hf in harmonic_freqs:
@@ -321,7 +330,8 @@ def loss_function(params: np.ndarray, w_norm: np.ndarray, h_target: np.ndarray, 
     if weight_mask is None or len(weight_mask) != len(h_target):
         weight_mask = np.ones_like(h_target)  # 若未提供遮罩，則使用全 1 的遮罩
 
-    # loss = np.mean(np.abs(h_iir - h_target)**2 * weight_mask) # 計算複數誤差(考慮振幅與相位)
+    #loss = np.mean(np.abs(h_iir - h_target)**2 * weight_mask) # 計算複數誤差(考慮振幅與相位)
+    #return loss
     # 也可以考慮其他損失函數，例如頻率響應的相位差異或加權損失等，根據實際需求調整。
     
     # 1. 振幅誤差 (dB 級別比較，避免線性尺度的極端值主導)
@@ -662,6 +672,7 @@ def resample_data(data: np.ndarray, original_fs: float, target_fs: float, visual
     down = int(original_fs // gcd)
 
     resampled_data = signal.resample_poly(data, up, down)
+    print(f"Resampled: {len(resampled_data)} samples", f" from {len(data)} samples at {original_fs} Hz to {target_fs} Hz")
 
     if visualize:
         plt.figure(figsize=(12, 6))
@@ -704,7 +715,7 @@ def run_anc_simulation(x: np.ndarray, rew_file_path: str, target_taps: int = 512
     S_hat = load_rew_ir_and_denoise(rew_file_path, target_taps=target_taps, visualize=True, pre_peak_margin=10, taper_ratio=0.1)
     
     # 模擬初級路徑 P(z)
-    P_simulated = create_simulated_primary_path(S, delay_samples=20, cutoff_freq=2000, Fs=fs)
+    P_simulated = create_simulated_primary_path(S, delay_samples=20, cutoff_freq=2000)
     d_n = np.convolve(x, P_simulated, mode='full')[:len(x)]
     
     # 執行 FxNLMS 訓練
@@ -786,29 +797,246 @@ def plot_psd_comparison(d: np.ndarray, e: np.ndarray, fs: int = 48000, nfft: int
     plt.tight_layout()
     plt.show()
 
+def filter_and_resampling(x: np.ndarray, 
+                            d: np.ndarray, 
+                            S_z: np.ndarray,  
+                            F_z: np.ndarray, 
+                            original_fs: int = 48000,
+                            target_fs: int = 48000,
+                            filter_sos: np.ndarray = None,
+                            ) -> tuple:
+    """
+    proprocess, with bandpass filtering and resampling, for ANC simulation.
+    bandpass filtering is optional, if bandpass_filter_sos is None, no filtering will be applied.
+    use scipy.signal.sosfilt for filtering, to avoid phase distortion like scipy.signal.filtfilt, and use
+    scipy.signal.resample_poly for resampling, which is more efficient and less memory intensive than scipy.signal.resample.
+
+
+    Args:
+        x (np.ndarray): 參考麥克風訊號
+        d (np.ndarray): 誤差麥克風訊號
+        S_z (np.ndarray): 次級路徑脈衝響應
+        F_z (np.ndarray): 回饋路徑脈衝響應
+        original_fs (int): 原始取樣率
+        target_fs (int): 目標取樣率
+        bandpass_filter_sos (np.ndarray): 帶通濾波器係數
+
+    Returns:
+        tuple: (x_resample, d_resample, S_z_resample, F_z_resample)
+            - x_resample (np.ndarray): 經過重取樣後的參考訊號
+            - d_resample (np.ndarray): 經過重取樣後的誤差訊號
+            - S_z_resample (np.ndarray): 經過重取樣後的次級路徑脈衝響應
+            - F_z_resample (np.ndarray): 經過重取樣後的回饋路徑脈衝響應
+    """
+    
+    # 對參考訊號與誤差訊號進行帶通濾波
+    if filter_sos is not None:
+        x_filtered = signal.sosfilt(filter_sos, x)
+        d_filtered = signal.sosfilt(filter_sos, d)
+    else:
+        x_filtered = x
+        d_filtered = d
+
+    x_resample = resample_data(x_filtered, original_fs=original_fs, target_fs=target_fs)
+    d_resample = resample_data(d_filtered, original_fs=original_fs, target_fs=target_fs)
+    F_z_resample = resample_data(F_z, original_fs=48000, target_fs=target_fs)
+    S_z_resample = resample_data(S_z, original_fs=48000, target_fs=target_fs)
+    
+    return x_resample, d_resample, S_z_resample, F_z_resample
+
+def compare_anc_result_with_and_without_filter(x: np.ndarray, 
+                                                 d: np.ndarray, 
+                                                 S_z: np.ndarray,
+                                                 original_fs: int, 
+                                                 target_fs: int, w_fir: np.ndarray, 
+                                                 filter_sos: np.ndarray):
+    """
+    比較濾波in-band與full-band的 ANC 模擬結果w_fir，並繪製功率譜密度 (PSD) 與降噪深度。
+    use scipy.signal.lfilter for filtering, to avoid phase distortion like scipy.signal.filtfilt.
+
+    Args:
+        x (np.ndarray): 參考麥克風訊號
+        d (np.ndarray): 誤差麥克風訊號
+        S_z (np.ndarray): 次級路徑脈衝響應
+        original_fs (int): 原始取樣率
+        target_fs (int): 目標取樣率
+        w_fir (np.ndarray): 用濾波訊號跑 FxNLMS 訓練後的 FIR 權重
+        filter_sos (np.ndarray): 帶通濾波器係數
+    """
+    x_resample = resample_data(x, original_fs=original_fs, target_fs=target_fs)
+    d_resample = resample_data(d, original_fs=original_fs, target_fs=target_fs)
+    S_z_resample = resample_data(S_z, original_fs=original_fs, target_fs=target_fs)
+    y_test = signal.lfilter(w_fir, [1.0], x_resample)
+    anti_noise = signal.lfilter(S_z_resample, [1.0], y_test)
+    e_test = d_resample + anti_noise
+    # 計算收斂後的降噪量
+    eval_length = 10000  # 評估最後 10000 個樣本的降噪量
+    d_power = np.mean(d_resample[-eval_length:]**2)  # 取最後 10000 個樣本的平均功率
+    e_power = np.mean(e_test[-eval_length:]**2)  # 取最後 10000 個樣本的平均功率
+    attenuation_db = 10 * np.log10(d_power / e_power) if e_power > 0 else float('inf')
+
+    # 帶內能量評估
+    d_eval_inband = signal.sosfiltfilt(filter_sos, d_resample[-eval_length:])
+    e_eval_inband = signal.sosfiltfilt(filter_sos, e_test[-eval_length:])
+    
+    d_power_inband = np.mean(d_eval_inband**2)
+    e_power_inband = np.mean(e_eval_inband**2)
+    att_inband = 10 * np.log10(d_power_inband / e_power_inband )if e_power_inband > 0 else float('inf')
+    
+    print("\n--- 降噪效能報告 ---")
+    print(f"全頻段降噪量 (受帶外噪聲掩蔽): {attenuation_db:.2f} dB")
+    print(f"有效頻段 (100-4000Hz) 降噪量:  {att_inband:.2f} dB")
+    print("--------------------\n") 
+    
+    # 繪製 PSD 與降噪深度比較
+    plot_results(d_resample, e_test, fs=dsp_fs)
+    plot_psd_comparison(d_resample, e_test, fs=dsp_fs, nfft=8192)
+
+# ==========================================
+# 工具一：時間軸截斷與加窗 (Time-Domain Windowing)
+# ==========================================
+def smooth_fir_by_windowing(w_fir: np.ndarray, target_taps: int = 256, taper_ratio: float = 0.2) -> np.ndarray:
+    """
+    將過長的 FIR 截短，並在尾端施加平滑衰減 (Fade-out)，去除晚期殘響雜訊。
+    這會產生一組非常適合送給 Biquad 優化器去自動擬合的乾淨 FIR。
+    在時域截斷等於在頻域捲積窗函數，會讓尖峰變成圓弧形。
+    
+    Args:
+        w_fir: 原始 1024-tap FIR 權重
+        target_taps: 想要保留的前段長度 (例如 256 或 128)
+        taper_ratio: 尾端佔總截斷長度的衰減比例 (例如 0.2 代表最後 20% 會平滑降至 0)
+    
+    Returns:
+        w_short: 處理後的短 FIR 陣列
+    """
+    if len(w_fir) <= target_taps:
+        return w_fir
+        
+    # 1. 截取前段 (這裡包含了最核心的因果物理延遲與主降噪波)
+    w_short = w_fir[:target_taps].copy()
+    
+    # 2. 計算衰減區間長度
+    fade_len = int(target_taps * taper_ratio)
+    
+    if fade_len > 0:
+        # 建立一個完整的 Hann 視窗，並只取它的後半段 (從 1 緩降到 0)
+        hann_full = signal.windows.hann(fade_len * 2)
+        fade_curve = hann_full[fade_len:]
+        
+        # 3. 將衰減曲線乘上 FIR 的尾巴，強迫隨機雜訊歸零
+        w_short[-fade_len:] *= fade_curve
+        
+    return w_short
+
+# ==========================================
+# 工具二：分數八度音階頻譜平滑 (Fractional-Octave Smoothing)
+# ==========================================
+def fractional_octave_smoothing(freqs: np.ndarray, mag_db: np.ndarray, fraction: float = 1/3) -> np.ndarray:
+    """
+    對頻譜振幅進行 1/N 八度音階平滑。
+    這非常適合用來畫圖，幫助您在 SigmaStudio 裡「手動」對齊 PEQ，而不會被毛刺干擾。
+    
+    Args:
+        freqs: 頻率陣列 (Hz)
+        mag_db: 對應的振幅陣列 (dB)
+        fraction: 平滑度 (1/3 是業界標準，1/1 會非常圓滑，1/6 較保留細節)
+        
+    Returns:
+        smoothed_mag: 平滑化後的振幅陣列 (dB)
+    """
+    smoothed_mag = np.zeros_like(mag_db)
+    
+    for i, fc in enumerate(freqs):
+        if fc <= 0:
+            smoothed_mag[i] = mag_db[i]
+            continue
+            
+        # 計算這個中心頻率對應的「滑動視窗」上下界
+        # 八度音階的特性是：高頻時視窗寬，低頻時視窗窄 (符合人類聽覺)
+        f_min = fc * (2.0 ** (-fraction / 2.0))
+        f_max = fc * (2.0 ** (fraction / 2.0))
+        
+        # 找出落在這個頻段內的所有資料點索引
+        idx = (freqs >= f_min) & (freqs <= f_max)
+        
+        # 將這個頻段內的 dB 值取平均
+        if np.any(idx):
+            smoothed_mag[i] = np.mean(mag_db[idx])
+        else:
+            smoothed_mag[i] = mag_db[i]
+            
+    return smoothed_mag
+
+# ==========================================
+# 測試與視覺化示範
+# ==========================================
+def compare_fir_and_spectrum(w_fir: np.ndarray, fs: int = 48000, target_taps: int = 256, taper_ratio: float = 0.2):
+    """
+    將原始 FIR 與截斷加窗後的 FIR 做比較，並繪製頻譜響應。
+    
+    Args:
+        w_fir: 原始 FIR 權重
+        fs: 取樣率
+        target_taps: 截斷後的 FIR 長度
+        taper_ratio: 尾端平滑比例
+    """
+    w_fir_clean = smooth_fir_by_windowing(w_fir, target_taps=target_taps, taper_ratio=taper_ratio)
+    
+    # 計算頻譜
+    eval_points = 1024
+    w, h_raw = signal.freqz(w_fir, worN=eval_points, fs=fs)
+    _, h_clean = signal.freqz(w_fir_clean, worN=eval_points, fs=fs)
+    
+    mag_raw = 20 * np.log10(np.abs(h_raw) + 1e-12)
+    mag_clean = 20 * np.log10(np.abs(h_clean) + 1e-12)
+    
+    # 執行 1/3 八度音階平滑 (僅用於視覺化)
+    mag_smoothed_1_3 = fractional_octave_smoothing(w, mag_raw, fraction=1/3)
+    
+    # 畫圖比較
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8))
+    
+    # 上半部：時間軸波形比較
+    ax1.plot(w_fir, label='Original FIR', alpha=0.5)
+    ax1.plot(w_fir_clean, label='Truncated & Windowed FIR', linewidth=2)
+    ax1.set_title("Time-Domain FIR Weights")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    
+    # 下半部：頻譜響應比較
+    valid_idx = (w >= 0) & (w <= 12000)
+    ax2.plot(w[valid_idx], mag_raw[valid_idx], label='Raw Spectrum', alpha=0.3, color='gray')
+    ax2.plot(w[valid_idx], mag_smoothed_1_3[valid_idx], label='1/3 Octave Smoothed', color='blue', linewidth=2)
+    ax2.plot(w[valid_idx], mag_clean[valid_idx], label='Spectrum of Windowed FIR', color='red', linestyle='--', linewidth=2)
+
+    ax2.set_title("Magnitude Response (Bode Plot)")
+    ax2.set_xlabel("Frequency (Hz)")
+    ax2.set_ylabel("Magnitude (dB)")
+    ax2.legend()
+    ax2.grid(True, which="both", ls="-", alpha=0.5)
+    
+    plt.tight_layout()
+    plt.show()
+
 if __name__ == "__main__":
-    '''
     #dsp_fs = 384000  # DSP 取樣率
     dsp_fs = 48000
-    flen = 2048
-    s_len = 3000
-    x, d, fs, metadata = load_and_scale_dsp_dac_output_data("100_dual_35820_10s.npz")
-    x_resample = resample_data(x, original_fs=fs, target_fs=dsp_fs)
-    print(f"Resampled x: {len(x_resample)} samples", f" from {len(x)} samples at {fs} Hz to {dsp_fs} Hz")
-    d_resample = resample_data(d, original_fs=fs, target_fs=dsp_fs)
-    print(f"Resampled d: {len(d_resample)} samples", f" from {len(d)} samples at {fs} Hz to {dsp_fs} Hz")
-    '''
-    F_z = load_rew_ir_and_denoise("R Jul 7 feedback path.txt", target_taps=2048, pre_peak_margin=20, taper_ratio=0.1, visualize=True)
-    #F_z = np.zeros(3000)  # 假設 F(z) 為零，因測試時ANC off 沒有輸出
-    S_z = load_rew_ir_and_denoise("R Jul 7 secondary path.txt", target_taps=2048, pre_peak_margin=20, taper_ratio=0.1, visualize=True)
-    '''
-    F_z_resample = resample_data(F_z, original_fs=48000, target_fs=dsp_fs)
-    S_z_resample = resample_data(S_z, original_fs=48000, target_fs=dsp_fs)
-    e, y, w_fir, x_net = run_fxnlms(x_resample, d_resample, S_z_resample, S_z_resample[:s_len], F_z_resample, mu=0.005, filter_length=flen)
+    flen = 1024
+    s_len = 2048
+    record_name = "100_dual_36159_60s.npz"
+    x, d, fs, metadata = load_and_scale_dsp_dac_output_data(record_name)
+    #sos_51200 = signal.butter(N=4, Wn=[300,4000], btype='bandpass', fs=fs, output='sos')
+    #F_z = load_rew_ir_and_denoise("R Aug 3 feedback path.txt", target_taps=2048, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
+    F_z = np.zeros(2048)  # 假設 F(z) 為零，因測試時ANC off 沒有輸出
+    S_z = load_rew_ir_and_denoise("R Aug 3 secondary path.txt", target_taps=s_len, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
     
+    x_resample, d_resample, S_z_resample, F_z_resample = filter_and_resampling(x, d, S_z, F_z, original_fs=fs, target_fs=dsp_fs)
+    e, y, w_fir, x_net = run_fxnlms(x_resample, d_resample, S_z_resample, S_z_resample[:s_len], F_z_resample, mu=0.007, filter_length=flen, leak=0.0)
+
+    #sos_48000 = signal.butter(N=4, Wn=[300, 4000], btype='bandpass', fs=dsp_fs, output='sos')
+    #compare_anc_result_with_and_without_filter(x, d, S_z, original_fs=fs, target_fs=dsp_fs, w_fir=w_fir, filter_sos=sos_48000)
     # 繪製結果
     #plot_results(d_resample, e, fs=dsp_fs)
     #plot_psd_comparison(d_resample, e, fs=dsp_fs, nfft=8192)
-    sos = convert_fir_to_biquad(w_fir=w_fir, eval_point=flen, original_fs=dsp_fs, target_fs=48000, num_biquads=8)
+    #sos = convert_fir_to_biquad(w_fir=w_fir[:256], eval_point=flen, original_fs=dsp_fs, target_fs=48000, num_biquads=8)
     #print_sigmastudio_coefficients(sos)
-    '''
