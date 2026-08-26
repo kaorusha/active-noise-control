@@ -3,6 +3,7 @@ import matplotlib.pyplot as plt
 import os
 import scipy.signal as signal
 from scipy.optimize import minimize, differential_evolution
+import scipy.io.wavfile as wavfile
 
 def generate_input_signal(T: int = 1000, Fs: int = 10000):
     """
@@ -506,7 +507,6 @@ def load_and_scale_dsp_dac_output_data(file_path: str, dsp_full_scale_voltage: f
             - fs (float): 取樣頻率。
             - metadata (dict): 包含原始資料型態與縮放比例的詮釋資料。
     """
-    from scipy.io import wavfile
     if not os.path.exists(file_path):
         raise FileNotFoundError(f"找不到檔案: {file_path}")
     
@@ -889,8 +889,8 @@ def compare_anc_result_with_and_without_filter(x: np.ndarray,
     print("--------------------\n") 
     
     # 繪製 PSD 與降噪深度比較
-    plot_results(d_resample, e_test, fs=dsp_fs)
-    plot_psd_comparison(d_resample, e_test, fs=dsp_fs, nfft=8192)
+    plot_results(d_resample, e_test, fs=target_fs)
+    plot_psd_comparison(d_resample, e_test, fs=target_fs, nfft=8192)
 
 # ==========================================
 # 工具一：時間軸截斷與加窗 (Time-Domain Windowing)
@@ -1018,7 +1018,106 @@ def compare_fir_and_spectrum(w_fir: np.ndarray, fs: int = 48000, target_taps: in
     plt.tight_layout()
     plt.show()
 
+def export_freq_response_for_rew(w_fir: np.ndarray, fs_target:int = 48000, filename:str = "Wz_response.txt"):
+    """
+    1. 剝離純延遲
+    2. 生成 REW 響應檔
+    """
+    # 定位主能量峰值延遲
+    delay_samples = np.argmax(np.abs(w_fir))
+    
+    # 頻響計算
+    w, h = signal.freqz(w_fir, a=1, worN=4096, fs=fs_target)
+    
+    # 補償純延遲相位: H_comp(w) = H(w) * exp(j * w * delay / fs)
+    phase_comp = np.exp(1j * 2 * np.pi * w * delay_samples / fs_target)
+    h_min = h * phase_comp
+    
+    # 振幅取反 (dB)
+    mag_db = 20 * np.log10(np.abs(h_min) + 1e-12)
+    phase_deg = np.angle(h_min, deg=True)
+    
+    with open(filename, "w") as f:
+        f.write("* W(z) for REW\n")
+        f.write(f"* Extracted Delay: {delay_samples} samples at {fs_target} Hz\n")
+        f.write("* Freq(Hz) Magnitude(dB) Phase(degrees)\n")
+        for freq, mag, ph in zip(w, mag_db, phase_deg):
+            f.write(f"{freq:.2f} {mag:.4f} {ph:.2f}\n")
+            
+    print(f"[Info] 檔案已輸出：{filename}")
+    print(f"[Info] 請在 ADAU1787 FastDSP 前端配置 Delay = {delay_samples} samples")
+
+def biquad_peaking(f0: float, gain_db: float, Q: float, fs: int = 384000):
+    """依據 Audio EQ Cookbook 計算 384kHz 下的 Peaking EQ 係數"""
+    A = 10**(gain_db / 40.0)
+    w0 = 2 * np.pi * f0 / fs
+    alpha = np.sin(w0) / (2 * Q)
+    
+    b0 = 1 + alpha * A
+    b1 = -2 * np.cos(w0)
+    b2 = 1 - alpha * A
+    a0 = 1 + alpha / A
+    a1 = -2 * np.cos(w0)
+    a2 = 1 - alpha / A
+    
+    # 歸一化 a0
+    return np.array([b0/a0, b1/a0, b2/a0, a1/a0, a2/a0])
+
+def to_5_23_hex(val: float):
+    """轉換浮點數為 ADAU1787 FastDSP 28-bit 5.23 格式十六進制字串"""
+    # 飽和截斷在 [-16.0, 16.0 - 2^-23]
+    val_clamped = np.clip(val, -16.0, 16.0 - (1.0 / (2**23)))
+    int_val = int(np.round(val_clamped * (2**23)))
+    if int_val < 0:
+        int_val = (1 << 28) + int_val
+    return f"0x{int_val & 0x0FFFFFFF:07X}"
+
+def export_wav_for_rew(w_fir: np.ndarray, fs_target:int = 48000, filename:str = "Wz_response.wav"):
+    """
+    將 FIR 權重轉換為 WAV 檔，方便在 REW 中做時域與頻域分析。
+
+    """
+    # 確保資料型別為 float32 並去除異常值
+    w_fir_clean = np.nan_to_num(w_fir.flatten()).astype(np.float32)
+    
+    # 輸出 WAV 檔案
+    wavfile.write(filename, fs_target, w_fir_clean)
+    print(f"[Info] FIR 權重已輸出為 WAV 檔：{filename}")
+
+def parse_rew_text_and_convert(filepath, fs_target=384000, invert_gain=True):
+    """
+    解析 REW 導出的文字檔並計算 FastDSP 係數
+    支援 CP950/UTF-8 編碼，僅讀取狀態為 ON 的濾波器
+    """
+    import re
+    filters = []
+    with open(filepath, 'r', encoding='utf-8', errors='ignore') as f:
+        for line in f:
+            # 匹配包含 PK (Peaking) 的有效濾波器列
+            # 格式範例：Filter 1: ON  PK  Fc 600.0 Hz  Gain -12.5 dB  Q 8.00
+            match = re.search(r'Filter\s+(\d+):\s+ON\s+PK\s+Fc\s+([\d\.]+)\s+Hz\s+Gain\s+([\-\d\.]+)\s+dB\s+Q\s+([\d\.]+)', line)
+            if match:
+                num = int(match.group(1))
+                fc = float(match.group(2))
+                gain_rew = float(match.group(3))
+                q = float(match.group(4))
+                # 若先前為正向消峰擬合，反轉符號以作為反相補償濾波器
+                actual_gain = -gain_rew if invert_gain else gain_rew
+                filters.append((num, fc, actual_gain, q))
+
+    print(f"--- 成功解析 {len(filters)} 組 Biquad 濾波器 (目標取樣率: {fs_target} Hz) ---")
+    for num, fc, g, q in filters:
+        sos = biquad_peaking(fc, g, q, fs=fs_target)
+        b0, b1, b2, a1, a2 = sos
+        print(f"// Filter {num}: Fc={fc} Hz, Actual Gain={g:+.2f} dB, Q={q}")
+        print(f"B0:  {to_5_23_hex(b0)}  ({b0:+.8f})")
+        print(f"B1:  {to_5_23_hex(b1)}  ({b1:+.8f})")
+        print(f"B2:  {to_5_23_hex(b2)}  ({b2:+.8f})")
+        print(f"-A1: {to_5_23_hex(-a1)}  ({-a1:+.8f})")
+        print(f"-A2: {to_5_23_hex(-a2)}  ({-a2:+.8f})\n")
+
 if __name__ == "__main__":
+    '''
     #dsp_fs = 384000  # DSP 取樣率
     dsp_fs = 48000
     flen = 1024
@@ -1040,3 +1139,5 @@ if __name__ == "__main__":
     #plot_psd_comparison(d_resample, e, fs=dsp_fs, nfft=8192)
     #sos = convert_fir_to_biquad(w_fir=w_fir[:256], eval_point=flen, original_fs=dsp_fs, target_fs=48000, num_biquads=8)
     #print_sigmastudio_coefficients(sos)
+    '''
+    parse_rew_text_and_convert("REW_EQ_biquad_100_duty.txt", fs_target=384000)
