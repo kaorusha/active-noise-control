@@ -153,27 +153,27 @@ def run_fxnlms(x: np.ndarray,
 
     return (e, y, w, x_net)
 
-def plot_results(x: np.ndarray, e: np.ndarray, fs: int = 48000, last_n: int = None):
+def plot_time_domain_residual_comparison(d: np.ndarray, e: np.ndarray, fs: int = 48000, last_n: int = None):
     '''
-    繪圖顯示成果
+    時域波形比較圖，顯示原始噪音 d(n) 與 FxNLMS 後的殘留噪音 e(n)
 
     Args:
-        x (array): 原始噪音訊號
+        d (array): 原始噪音訊號
         e (array): FxNLMS 後的殘留噪音
         fs (int): 取樣頻率
         last_n (int): 顯示最後 N 個樣本的結果
     '''
-    if len(x) != len(e):
-        raise ValueError("x 與 e 的長度必須相同")
-    t = np.arange(len(x)) / fs
+    if len(d) != len(e):
+        raise ValueError("d 與 e 的長度必須相同")
+    t = np.arange(len(d)) / fs
     if last_n is not None:
         t = t[-last_n:]
-        x = x[-last_n:]
+        d = d[-last_n:]
         e = e[-last_n:]
     plt.figure(figsize=(10, 6))
-    plt.plot(t, x, label='Original Noise x(n)', alpha=0.5)
+    plt.plot(t, d, label='Original Noise d(n)', alpha=0.5)
     plt.plot(t, e, label='Residual Noise e(n) after ANC', color='red', alpha=0.7)
-    plt.title('FxNLMS Convergence Results')
+    plt.title('Time-domain Residual Comparison (Last {} samples)'.format(last_n if last_n else len(d)))
     plt.xlabel('Time (s)')
     plt.ylabel('Amplitude')
     plt.legend()
@@ -724,7 +724,7 @@ def run_anc_simulation(x: np.ndarray, rew_file_path: str, target_taps: int = 512
     e, y, w_fir, x_net = run_fxnlms(x, d_n, S, S_hat, F, mu=mu, filter_length=filter_length)
     
     # 繪製結果
-    plot_results(x, e)
+    plot_time_domain_residual_comparison(x, e)
     
     '''
     # --- 步驟 4：將 FIR 權重轉換為 ADAU1787 的 Biquad 係數 ---
@@ -738,16 +738,21 @@ def run_anc_simulation(x: np.ndarray, rew_file_path: str, target_taps: int = 512
     print_sigmastudio_coefficients(sos_matrix)
     '''
 
-def plot_psd_comparison(d: np.ndarray, e: np.ndarray, fs: int = 48000, nfft: int = 8192):
+def plot_psd_comparison(d: np.ndarray, e: np.ndarray, fs: int = 48000, nfft: int = 8192, 
+                        frequencies_to_mark: list = [],
+                        visualize: bool = True):
     """
     計算並繪製原始誤差 d(n) 與殘留誤差 e(n) 的功率譜密度 (PSD)。
     用以觀察 FxNLMS 在特定頻率 (窄頻) 上的真實降噪深度。
+    標記關注的特定頻率點 (例如 100Hz, 200Hz, 500Hz, 1kHz, 2kHz) 的降噪深度。
     
     Args:
         d (np.ndarray): ANC Off 時的誤差麥克風訊號 (原始噪音)
         e (np.ndarray): ANC On 且 FxNLMS 收斂後的殘留誤差
         fs (int): 取樣率
         nfft (int): FFT 點數 (越高頻率解析度越好，建議 8192)
+        frequencies_to_mark (list): 要標記的頻率點列表
+        visualize (bool): 是否顯示圖形
     """
     # 確保訊號長度一致，並取最後一半的資料 (確保 FxNLMS 已經達到穩態收斂)
     min_len = min(len(d), len(e))
@@ -767,35 +772,39 @@ def plot_psd_comparison(d: np.ndarray, e: np.ndarray, fs: int = 48000, nfft: int
 
     # 計算各頻率點的實際降噪深度 (Attenuation = d_dB - e_dB)
     attenuation = pxx_d_db - pxx_e_db
+    for freq in frequencies_to_mark:
+        idx = np.argmin(np.abs(f_d - freq))
+        print(f"Frequency: {f_d[idx]:.1f} Hz, Attenuation: {attenuation[idx]:.2f} dB")
 
-    # 繪圖
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
-    fig.canvas.manager.set_window_title('PSD and Narrowband Attenuation')
+    if visualize:
+        # 繪圖
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 8), sharex=True)
+        fig.canvas.manager.set_window_title('PSD and Narrowband Attenuation')
 
-    # 上半部：PSD 絕對能量比較
-    ax1.semilogx(f_d, pxx_d_db, label='ANC OFF: Original $d(n)$', color='blue', alpha=0.7)
-    ax1.semilogx(f_e, pxx_e_db, label='ANC ON: Residual $e(n)$', color='red', alpha=0.7)
-    ax1.set_ylabel('Power Spectral Density (dB/Hz)')
-    ax1.set_title('Power Spectral Density Comparison (Steady State)')
-    ax1.legend(loc='upper right')
-    ax1.grid(True, which="major", ls="-", alpha=0.6)
-    ax1.grid(True, which="minor", ls="--", alpha=0.3)
-    ax1.set_xlim([20, 20000])
+        # 上半部：PSD 絕對能量比較
+        ax1.semilogx(f_d, pxx_d_db, label='ANC OFF: Original $d(n)$', color='blue', alpha=0.7)
+        ax1.semilogx(f_e, pxx_e_db, label='ANC ON: Residual $e(n)$', color='red', alpha=0.7)
+        ax1.set_ylabel('Power Spectral Density (dB/Hz)')
+        ax1.set_title('Power Spectral Density Comparison (Steady State)')
+        ax1.legend(loc='upper right')
+        ax1.grid(True, which="major", ls="-", alpha=0.6)
+        ax1.grid(True, which="minor", ls="--", alpha=0.3)
+        ax1.set_xlim([20, 20000])
 
-    # 下半部：各頻帶降噪深度
-    # 將低於 0 dB (噪音放大) 的部分填色警告
-    ax2.semilogx(f_d, attenuation, label='Attenuation (dB)', color='green')
-    ax2.fill_between(f_d, attenuation, 0, where=(attenuation >= 0), color='green', alpha=0.3, label='Noise Reduced')
-    ax2.fill_between(f_d, attenuation, 0, where=(attenuation < 0), color='red', alpha=0.3, label='Noise Enhanced')
-    ax2.set_xlabel('Frequency (Hz)')
-    ax2.set_ylabel('Attenuation (dB)')
-    ax2.set_title('Narrowband Attenuation Depth')
-    ax2.legend(loc='upper right')
-    ax2.grid(True, which="major", ls="-", alpha=0.6)
-    ax2.grid(True, which="minor", ls="--", alpha=0.3)
+        # 下半部：各頻帶降噪深度
+        # 將低於 0 dB (噪音放大) 的部分填色警告
+        ax2.semilogx(f_d, attenuation, label='Attenuation (dB)', color='green')
+        ax2.fill_between(f_d, attenuation, 0, where=(attenuation >= 0), color='green', alpha=0.3, label='Noise Reduced')
+        ax2.fill_between(f_d, attenuation, 0, where=(attenuation < 0), color='red', alpha=0.3, label='Noise Enhanced')
+        ax2.set_xlabel('Frequency (Hz)')
+        ax2.set_ylabel('Attenuation (dB)')
+        ax2.set_title('Narrowband Attenuation Depth')
+        ax2.legend(loc='upper right')
+        ax2.grid(True, which="major", ls="-", alpha=0.6)
+        ax2.grid(True, which="minor", ls="--", alpha=0.3)
 
-    plt.tight_layout()
-    plt.show()
+        plt.tight_layout()
+        plt.show()
 
 def filter_and_resampling(x: np.ndarray, 
                             d: np.ndarray, 
@@ -1061,7 +1070,7 @@ def biquad_peaking(f0: float, gain_db: float, Q: float, fs: int = 384000):
     a2 = 1 - alpha / A
     
     # 歸一化 a0
-    return np.array([b0/a0, b1/a0, b2/a0, a1/a0, a2/a0])
+    return np.array([b0/a0, b1/a0, b2/a0, 1.0, a1/a0, a2/a0])
 
 def to_5_23_hex(val: float):
     """轉換浮點數為 ADAU1787 FastDSP 28-bit 5.23 格式十六進制字串"""
@@ -1084,7 +1093,7 @@ def export_wav_for_rew(w_fir: np.ndarray, fs_target:int = 48000, filename:str = 
     wavfile.write(filename, fs_target, w_fir_clean)
     print(f"[Info] FIR 權重已輸出為 WAV 檔：{filename}")
 
-def parse_rew_text_and_convert(filepath, fs_target=384000, invert_gain=True):
+def parse_rew_text_and_convert(filepath, fs_target=384000, invert_gain=True, print_enabled=True):
     """
     解析 REW 導出的文字檔並計算 FastDSP 係數
     支援 CP950/UTF-8 編碼，僅讀取狀態為 ON 的濾波器
@@ -1106,18 +1115,89 @@ def parse_rew_text_and_convert(filepath, fs_target=384000, invert_gain=True):
                 filters.append((num, fc, actual_gain, q))
 
     print(f"--- 成功解析 {len(filters)} 組 Biquad 濾波器 (目標取樣率: {fs_target} Hz) ---")
+    sos_list = []
     for num, fc, g, q in filters:
         sos = biquad_peaking(fc, g, q, fs=fs_target)
-        b0, b1, b2, a1, a2 = sos
-        print(f"// Filter {num}: Fc={fc} Hz, Actual Gain={g:+.2f} dB, Q={q}")
-        print(f"B0:  {to_5_23_hex(b0)}  ({b0:+.8f})")
-        print(f"B1:  {to_5_23_hex(b1)}  ({b1:+.8f})")
-        print(f"B2:  {to_5_23_hex(b2)}  ({b2:+.8f})")
-        print(f"-A1: {to_5_23_hex(-a1)}  ({-a1:+.8f})")
-        print(f"-A2: {to_5_23_hex(-a2)}  ({-a2:+.8f})\n")
+        sos_list.append(sos)
+        b0, b1, b2, _, a1, a2 = sos
+        if print_enabled == True:
+            print(f"// Filter {num}: Fc={fc} Hz, Actual Gain={g:+.2f} dB, Q={q}")
+            print(f"B0:  {to_5_23_hex(b0)}  ({b0:+.8f})")
+            print(f"B1:  {to_5_23_hex(b1)}  ({b1:+.8f})")
+            print(f"B2:  {to_5_23_hex(b2)}  ({b2:+.8f})")
+            print(f"-A1: {to_5_23_hex(-a1)}  ({-a1:+.8f})")
+            print(f"-A2: {to_5_23_hex(-a2)}  ({-a2:+.8f})\n")
+    return np.array(sos_list)
+
+def simulate_biquad_anc(x, d, sec_path, sos_matrix, fs=48000, delay_samples=19,
+                        frequancies_tomark: list = [],
+                        visualize: bool = True):
+    """
+    模擬 Biquad 串聯 ANC 系統，並計算降噪量與頻譜。
+    """
+    # 確保資料為 1D 浮點數且長度一致
+    x = np.nan_to_num(x.flatten()).astype(np.float64)
+    d = np.nan_to_num(d.flatten()).astype(np.float64)
+    sec_path = np.nan_to_num(sec_path.flatten()).astype(np.float64)
+    min_len = min(len(x), len(d))
+    x, d = x[:min_len], d[:min_len]
+
+    # ==========================================
+    # 執行閉迴路訊號鏈過濾
+    # ==========================================
+    # 步驟 A: 空間純延遲補償
+    x_del = np.zeros_like(x)
+    if delay_samples < len(x):
+        x_del[delay_samples:] = x[:-delay_samples]
+
+    # 步驟 B: 通過 Biquad 串聯
+    y = signal.sosfilt(sos_matrix, x_del)
+
+    # 步驟 C: 通過次級路徑 S(z)
+    y_sec = signal.lfilter(sec_path, 1, y)
+
+    # 步驟 D: 殘差計算 (自動偵測正反相極性)
+    e_opt1 = d - y_sec
+    e_opt2 = d + y_sec
+
+    # 略過前 0.2 秒暫態建立期
+    eval_start = int(0.2 * fs)
+    p_d = np.mean(d[eval_start:]**2)
+    p_e1 = np.mean(e_opt1[eval_start:]**2)
+    p_e2 = np.mean(e_opt2[eval_start:]**2)
+
+    if p_e1 <= p_e2:
+        e = e_opt1
+        polarity_str = "d(n) - y_sec(n) [標準反相]"
+    else:
+        e = e_opt2
+        polarity_str = "d(n) + y_sec(n) [同相疊加]"
+
+    # ==========================================
+    # 降噪量 (NR) 與頻譜計算
+    # ==========================================
+    # 全頻段降噪量
+    p_e = np.mean(e[eval_start:]**2)
+    nr_overall = 10 * np.log10(p_d / (p_e + 1e-12))
+
+    # 帶限降噪量 (100 ~ 4000 Hz)
+    sos_bp = signal.butter(4, [100, 4000], btype='bandpass', fs=fs, output='sos')
+    d_bp = signal.sosfilt(sos_bp, d)
+    e_bp = signal.sosfilt(sos_bp, e)
+    p_d_bp = np.mean(d_bp[eval_start:]**2)
+    p_e_bp = np.mean(e_bp[eval_start:]**2)
+    nr_band = 10 * np.log10(p_d_bp / (p_e_bp + 1e-12))
+
+    print("\n==========================================")
+    print(f"極性判定方式: {polarity_str}")
+    print(f"全頻段降噪量 (Overall NR): {nr_overall:+.2f} dB")
+    print(f"有效帶限降噪量 (100-4000Hz): {nr_band:+.2f} dB")
+    print("==========================================\n")
+    plot_psd_comparison(d, e, fs=fs, frequancies_tomark=frequancies_tomark, visualize=visualize)
+    plot_time_domain_residual_comparison(d, e, fs=fs)
 
 if __name__ == "__main__":
-    '''
+    
     #dsp_fs = 384000  # DSP 取樣率
     dsp_fs = 48000
     flen = 1024
@@ -1130,14 +1210,14 @@ if __name__ == "__main__":
     S_z = load_rew_ir_and_denoise("R Aug 3 secondary path.txt", target_taps=s_len, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
     
     x_resample, d_resample, S_z_resample, F_z_resample = filter_and_resampling(x, d, S_z, F_z, original_fs=fs, target_fs=dsp_fs)
-    e, y, w_fir, x_net = run_fxnlms(x_resample, d_resample, S_z_resample, S_z_resample[:s_len], F_z_resample, mu=0.007, filter_length=flen, leak=0.0)
+    #e, y, w_fir, x_net = run_fxnlms(x_resample, d_resample, S_z_resample, S_z_resample[:s_len], F_z_resample, mu=0.007, filter_length=flen, leak=0.0)
 
     #sos_48000 = signal.butter(N=4, Wn=[300, 4000], btype='bandpass', fs=dsp_fs, output='sos')
     #compare_anc_result_with_and_without_filter(x, d, S_z, original_fs=fs, target_fs=dsp_fs, w_fir=w_fir, filter_sos=sos_48000)
     # 繪製結果
-    #plot_results(d_resample, e, fs=dsp_fs)
+    #plot_time_domain_residual_comparison(d_resample, e, fs=dsp_fs)
     #plot_psd_comparison(d_resample, e, fs=dsp_fs, nfft=8192)
     #sos = convert_fir_to_biquad(w_fir=w_fir[:256], eval_point=flen, original_fs=dsp_fs, target_fs=48000, num_biquads=8)
     #print_sigmastudio_coefficients(sos)
-    '''
-    parse_rew_text_and_convert("REW_EQ_biquad_100_duty.txt", fs_target=384000)
+    sos_matrix = parse_rew_text_and_convert("REW_300hz_4000hz_biquad_100_duty_0827_1045.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
+    simulate_biquad_anc(x_resample, d_resample, S_z_resample, sos_matrix, fs=dsp_fs, delay_samples=19)
