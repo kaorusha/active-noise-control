@@ -4,6 +4,7 @@ import os
 import scipy.signal as signal
 from scipy.optimize import minimize, differential_evolution
 import scipy.io.wavfile as wavfile
+from typing import Literal
 
 def generate_input_signal(T: int = 1000, Fs: int = 10000):
     """
@@ -806,16 +807,94 @@ def plot_psd_comparison(d: np.ndarray, e: np.ndarray, fs: int = 48000, nfft: int
         plt.tight_layout()
         plt.show()
 
+class FIRFilter:
+    """
+    FIR 濾波器類別 (支援因果濾波、嚴格零相位濾波與波德圖繪製)
+    """
+    def __init__(
+        self,
+        cutoff: float | list = [100, 4000],
+        pass_zero: Literal['bandpass', 'lowpass', 'highpass'] = 'bandpass',
+        numtaps: int = 201,
+        window: str = 'hamming',
+        fs: int = 48000
+    ):
+        """
+        初始化 FIR 濾波器
+
+        Args:
+            cutoff (float | list): 截止頻率 (Hz)，單一數值 (低通/高通) 或頻帶區間 [f_low, f_high] (帶通)
+            pass_zero (Literal['bandpass', 'lowpass', 'highpass']): 通帶類型，對應 scipy.signal.firwin 的 pass_zero
+            numtaps (int): 濾波器階數 / 長度 (若為偶數會自動 +1 確保整數群延遲)
+            window (str): 窗函數類型 (預設 'hamming')
+            fs (int): 取樣頻率 (Hz)
+        """
+        # 確保 numtaps 為奇數以獲得整數群延遲 (Type I FIR)
+        if numtaps % 2 == 0:
+            numtaps += 1
+
+        self.cutoff = cutoff
+        self.pass_zero = pass_zero
+        self.numtaps = numtaps
+        self.window = window
+        self.fs = fs
+        self.tau = (self.numtaps - 1) // 2  # 整數群延遲 (samples)
+
+        # 預先設計並快取濾波器係數
+        self.coeff = signal.firwin(
+            numtaps=self.numtaps,
+            cutoff=self.cutoff,
+            pass_zero=self.pass_zero,
+            window=self.window,
+            fs=self.fs
+        )
+
+    def get_coeff(self) -> np.ndarray:
+        """取得濾波器係數 (FIR taps)"""
+        return self.coeff
+
+    def get_tau(self) -> int:
+        """取得群延遲點數 (samples)"""
+        return self.tau
+
+    def filter_causal(self, x: np.ndarray) -> np.ndarray:
+        """
+        標準因果卷積濾波 (訊號將被延遲 tau 點)
+        """
+        return signal.lfilter(self.coeff, 1.0, x)
+
+    def filter_zero_phase(self, x: np.ndarray) -> np.ndarray:
+        """
+        使用奇數階對稱 FIR + 時間軸向左平移 tau 點，消除相位延遲達成零相位濾波
+        """
+        # 1. 因果卷積濾波
+        y_causal = signal.lfilter(self.coeff, 1.0, x)
+        # 2. 向左平移 tau 點消除群延遲
+        y_zero_phase = np.roll(y_causal, -self.tau)
+        # 3. 清除末端循環卷積產生的邊界偽影
+        y_zero_phase[-self.tau:] = 0.0
+        return y_zero_phase
+
+    def __call__(self, x: np.ndarray, zero_phase: bool = True) -> np.ndarray:
+        """
+        支援物件直接呼叫進行濾波: y = fir(x)
+        """
+        return self.filter_zero_phase(x) if zero_phase else self.filter_causal(x)
+
+    def plot_bode(self, title: str = "FIR Filter Bode Diagram"):
+        """繪製波德圖 (Bode Diagram)"""
+        plot_bode_diagram(self.coeff, fs=self.fs, title=title)
+
 def filter_and_resampling(x: np.ndarray, 
                             d: np.ndarray, 
                             S_z: np.ndarray,  
                             F_z: np.ndarray, 
                             original_fs: int = 48000,
                             target_fs: int = 48000,
-                            filter_sos: np.ndarray = None,
+                            filter: FIRFilter = None
                             ) -> tuple:
     """
-    proprocess, with bandpass filtering and resampling, for ANC simulation.
+    proprocess, with filtering and resampling, for ANC simulation.
     bandpass filtering is optional, if bandpass_filter_sos is None, no filtering will be applied.
     use scipy.signal.sosfilt for filtering, to avoid phase distortion like scipy.signal.filtfilt, and use
     scipy.signal.resample_poly for resampling, which is more efficient and less memory intensive than scipy.signal.resample.
@@ -828,7 +907,7 @@ def filter_and_resampling(x: np.ndarray,
         F_z (np.ndarray): 回饋路徑脈衝響應
         original_fs (int): 原始取樣率
         target_fs (int): 目標取樣率
-        bandpass_filter_sos (np.ndarray): 帶通濾波器係數
+        filter_sos (np.ndarray): 濾波器係數
 
     Returns:
         tuple: (x_resample, d_resample, S_z_resample, F_z_resample)
@@ -839,9 +918,9 @@ def filter_and_resampling(x: np.ndarray,
     """
     
     # 對參考訊號與誤差訊號進行帶通濾波
-    if filter_sos is not None:
-        x_filtered = signal.sosfilt(filter_sos, x)
-        d_filtered = signal.sosfilt(filter_sos, d)
+    if filter is not None:
+        x_filtered = filter.filter_zero_phase(x)
+        d_filtered = filter.filter_zero_phase(d)
     else:
         x_filtered = x
         d_filtered = d
@@ -864,19 +943,18 @@ def compare_anc_result_with_and_without_filter(x: np.ndarray,
     use scipy.signal.lfilter for filtering, to avoid phase distortion like scipy.signal.filtfilt.
 
     Args:
-        x (np.ndarray): 參考麥克風訊號
-        d (np.ndarray): 誤差麥克風訊號
+        x (np.ndarray): 參考麥克風訊號(未濾波前)
+        d (np.ndarray): 誤差麥克風訊號(未濾波前)
         S_z (np.ndarray): 次級路徑脈衝響應
-        original_fs (int): 原始取樣率
+        original_fs (int): 原始取樣率，原始未濾波前的x和d的取樣頻率
         target_fs (int): 目標取樣率
         w_fir (np.ndarray): 用濾波訊號跑 FxNLMS 訓練後的 FIR 權重
         filter_sos (np.ndarray): 帶通濾波器係數
     """
     x_resample = resample_data(x, original_fs=original_fs, target_fs=target_fs)
     d_resample = resample_data(d, original_fs=original_fs, target_fs=target_fs)
-    S_z_resample = resample_data(S_z, original_fs=original_fs, target_fs=target_fs)
     y_test = signal.lfilter(w_fir, [1.0], x_resample)
-    anti_noise = signal.lfilter(S_z_resample, [1.0], y_test)
+    anti_noise = signal.lfilter(S_z, [1.0], y_test)
     e_test = d_resample + anti_noise
     # 計算收斂後的降噪量
     eval_length = 10000  # 評估最後 10000 個樣本的降噪量
@@ -898,7 +976,7 @@ def compare_anc_result_with_and_without_filter(x: np.ndarray,
     print("--------------------\n") 
     
     # 繪製 PSD 與降噪深度比較
-    plot_results(d_resample, e_test, fs=target_fs)
+    plot_time_domain_residual_comparison(d_resample, e_test, fs=target_fs)
     plot_psd_comparison(d_resample, e_test, fs=target_fs, nfft=8192)
 
 # ==========================================
@@ -1196,28 +1274,83 @@ def simulate_biquad_anc(x, d, sec_path, sos_matrix, fs=48000, delay_samples=19,
     plot_psd_comparison(d, e, fs=fs, frequancies_tomark=frequancies_tomark, visualize=visualize)
     plot_time_domain_residual_comparison(d, e, fs=fs)
 
-if __name__ == "__main__":
+def plot_bode_diagram(filter_data: np.ndarray|tuple, fs=48000, title="Filter Bode Diagram"):
+    """
+    計算並繪製濾波器之波德圖 (振幅、解卷繞相位、群延遲)
+    使用數值微分計算 Group Delay
     
+    通用波德圖繪製函式:
+    - 若 filter_data 為 1D 陣列: 自動識別為 FIR 係數 (fir_coeff)
+    - 若 filter_data 為 2D 陣列 (N, 6): 自動識別為 IIR SOS 矩陣
+    - 若 filter_data 為 tuple (b, a): 自動識別為傳遞函數多項式
+    """
+    # 1. 自動辨識輸入格式並計算頻率響應
+    if isinstance(filter_data, np.ndarray) and filter_data.ndim == 1:
+        # FIR 係數
+        w, h = signal.freqz(filter_data, a=1.0, worN=8192, fs=fs)
+    elif isinstance(filter_data, np.ndarray) and filter_data.ndim == 2:
+        # IIR SOS 矩陣
+        w, h = signal.sosfreqz(filter_data, worN=8192, fs=fs)
+    elif isinstance(filter_data, tuple):
+        # (b, a)
+        b, a = filter_data
+        w, h = signal.freqz(b, a, worN=8192, fs=fs)
+    else:
+        raise ValueError("不支援的輸入格式。")
+    
+    # 2. 計算振幅與解卷繞相位
+    mag_db = 20 * np.log10(np.abs(h) + 1e-12)
+    # 解卷繞相位 (Unwrapped Phase)
+    phase_rad = np.unwrap(np.angle(h))
+    phase_deg = phase_rad * 180.0 / np.pi
+    # 3. 數值微分計算群延遲: tau_g = - d(phase_rad) / d(omega)
+    # omega = 2 * pi * f (rad/s)
+    d_omega = 2.0 * np.pi * (w - w[0])
+    gd_seconds = -np.gradient(phase_rad, d_omega)
+    gd_ms = gd_seconds * 1000.0  # 轉換為毫秒 (ms)
+    
+    fig, axs = plt.subplots(3, 1, figsize=(10, 8), sharex=True)
+    
+    # 振幅響應
+    axs[0].plot(w, mag_db, 'b', lw=1.5)
+    axs[0].set_ylabel('Magnitude (dB)')
+    axs[0].set_title(title)
+    axs[0].grid(True, which='both', ls=':')
+    
+    # 相位響應
+    axs[1].plot(w, phase_deg, 'r', lw=1.5)
+    axs[1].set_ylabel('Unwrapped Phase (deg)')
+    axs[1].grid(True, which='both', ls=':')
+    
+    # 群延遲
+    axs[2].plot(w, gd_ms, 'g', lw=1.5)
+    axs[2].set_ylabel('Group Delay (ms)')
+    axs[2].set_xlabel('Frequency (Hz)')
+    axs[2].set_xlim([20, 10000])
+    axs[2].grid(True, which='both', ls=':')
+    
+    plt.tight_layout()
+    plt.show()
+
+if __name__ == "__main__":
     #dsp_fs = 384000  # DSP 取樣率
     dsp_fs = 48000
     flen = 1024
     s_len = 2048
     record_name = "100_dual_36159_60s.npz"
     x, d, fs, metadata = load_and_scale_dsp_dac_output_data(record_name)
-    #sos_51200 = signal.butter(N=4, Wn=[300,4000], btype='bandpass', fs=fs, output='sos')
     #F_z = load_rew_ir_and_denoise("R Aug 3 feedback path.txt", target_taps=2048, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
     F_z = np.zeros(2048)  # 假設 F(z) 為零，因測試時ANC off 沒有輸出
     S_z = load_rew_ir_and_denoise("R Aug 3 secondary path.txt", target_taps=s_len, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
-    
-    x_resample, d_resample, S_z_resample, F_z_resample = filter_and_resampling(x, d, S_z, F_z, original_fs=fs, target_fs=dsp_fs)
-    #e, y, w_fir, x_net = run_fxnlms(x_resample, d_resample, S_z_resample, S_z_resample[:s_len], F_z_resample, mu=0.007, filter_length=flen, leak=0.0)
-
-    #sos_48000 = signal.butter(N=4, Wn=[300, 4000], btype='bandpass', fs=dsp_fs, output='sos')
-    #compare_anc_result_with_and_without_filter(x, d, S_z, original_fs=fs, target_fs=dsp_fs, w_fir=w_fir, filter_sos=sos_48000)
+    fir = FIRFilter(cutoff=[300, 4000], pass_zero='bandpass', fs=fs)
+    x_resample, d_resample, S_z_resample, F_z_resample = filter_and_resampling(x, d, S_z, F_z, original_fs=fs, target_fs=dsp_fs, filter=fir)
+    e, y, w_fir, x_net = run_fxnlms(x_resample, d_resample, S_z_resample, S_z_resample[:s_len], F_z_resample, mu=0.007, filter_length=flen, leak=0.0)
+    sos_48000 = signal.butter(N=4, Wn=[300, 4000], btype='bandpass', fs=dsp_fs, output='sos')
+    compare_anc_result_with_and_without_filter(x, d, S_z_resample, original_fs=fs, target_fs=dsp_fs, w_fir=w_fir, filter_sos=sos_48000)
     # 繪製結果
     #plot_time_domain_residual_comparison(d_resample, e, fs=dsp_fs)
     #plot_psd_comparison(d_resample, e, fs=dsp_fs, nfft=8192)
     #sos = convert_fir_to_biquad(w_fir=w_fir[:256], eval_point=flen, original_fs=dsp_fs, target_fs=48000, num_biquads=8)
     #print_sigmastudio_coefficients(sos)
-    sos_matrix = parse_rew_text_and_convert("REW_300hz_4000hz_biquad_100_duty_0827_1045.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
-    simulate_biquad_anc(x_resample, d_resample, S_z_resample, sos_matrix, fs=dsp_fs, delay_samples=19)
+    #sos_matrix = parse_rew_text_and_convert("REW_300hz_4000hz_biquad_100_duty_0827_1045.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
+    #simulate_biquad_anc(x_resample, d_resample, S_z_resample, sos_matrix, fs=dsp_fs, delay_samples=19)
