@@ -1208,7 +1208,7 @@ def parse_rew_text_and_convert(filepath, fs_target=384000, invert_gain=True, pri
     return np.array(sos_list)
 
 def simulate_biquad_anc(x, d, sec_path, sos_matrix, fs=48000, delay_samples=19,
-                        frequancies_tomark: list = [],
+                        frequencies_to_mark: list = [],
                         visualize: bool = True):
     """
     模擬 Biquad 串聯 ANC 系統，並計算降噪量與頻譜。
@@ -1271,7 +1271,7 @@ def simulate_biquad_anc(x, d, sec_path, sos_matrix, fs=48000, delay_samples=19,
     print(f"全頻段降噪量 (Overall NR): {nr_overall:+.2f} dB")
     print(f"有效帶限降噪量 (100-4000Hz): {nr_band:+.2f} dB")
     print("==========================================\n")
-    plot_psd_comparison(d, e, fs=fs, frequancies_tomark=frequancies_tomark, visualize=visualize)
+    plot_psd_comparison(d, e, fs=fs, frequencies_to_mark=frequencies_to_mark, visualize=visualize)
     plot_time_domain_residual_comparison(d, e, fs=fs)
 
 def plot_bode_diagram(filter_data: np.ndarray|tuple, fs=48000, title="Filter Bode Diagram"):
@@ -1342,15 +1342,13 @@ if __name__ == "__main__":
     #F_z = load_rew_ir_and_denoise("R Aug 3 feedback path.txt", target_taps=2048, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
     F_z = np.zeros(2048)  # 假設 F(z) 為零，因測試時ANC off 沒有輸出
     S_z = load_rew_ir_and_denoise("R Aug 3 secondary path.txt", target_taps=s_len, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
-    fir_fs = FIRFilter(cutoff=[300, 4000], pass_zero='bandpass', fs=fs)
-    x_resample, d_resample, S_z_resample, F_z_resample = filter_and_resampling(x, d, S_z, F_z, original_fs=fs, target_fs=dsp_fs, filter=fir_fs)
-    e, y, w_fir, x_net = run_fxnlms(x_resample, d_resample, S_z_resample, S_z_resample[:s_len], F_z_resample, mu=0.007, filter_length=flen, leak=0.0)
-    fir_dsp_fs = FIRFilter(cutoff=[300, 4000], pass_zero='bandpass', fs= dsp_fs)
-    compare_anc_result_with_and_without_filter(x, d, S_z_resample, original_fs=fs, target_fs=dsp_fs, w_fir=w_fir, filter=fir_dsp_fs)
+    #fir_fs = FIRFilter(cutoff=[300,4000], pass_zero='bandpass', fs=fs)
+    x_resample, d_resample, S_z_resample, F_z_resample = filter_and_resampling(x, d, S_z, F_z, original_fs=fs, target_fs=dsp_fs, filter=None)
+    #e, y, w_fir, x_net = run_fxnlms(x_resample, d_resample, S_z_resample, S_z_resample[:s_len], F_z_resample, mu=0.007, filter_length=flen, leak=0.0)
+    #fir_dsp_fs = FIRFilter(cutoff=[300,4000], pass_zero='bandpass', fs= dsp_fs)
+    #compare_anc_result_with_and_without_filter(x, d, S_z_resample, original_fs=fs, target_fs=dsp_fs, w_fir=w_fir, filter=fir_dsp_fs)
     # 繪製結果
     #plot_time_domain_residual_comparison(d_resample, e, fs=dsp_fs)
     #plot_psd_comparison(d_resample, e, fs=dsp_fs, nfft=8192)
-    #sos = convert_fir_to_biquad(w_fir=w_fir[:256], eval_point=flen, original_fs=dsp_fs, target_fs=48000, num_biquads=8)
-    #print_sigmastudio_coefficients(sos)
-    #sos_matrix = parse_rew_text_and_convert("REW_300hz_4000hz_biquad_100_duty_0827_1045.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
-    #simulate_biquad_anc(x_resample, d_resample, S_z_resample, sos_matrix, fs=dsp_fs, delay_samples=19)
+    sos_matrix = parse_rew_text_and_convert("REW_300hz_4000hz_biquad_100_duty_0827_1045.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
+    simulate_biquad_anc(x_resample, d_resample, S_z_resample, sos_matrix, fs=dsp_fs, delay_samples=19, frequencies_to_mark=[600, 3600])
