@@ -937,7 +937,7 @@ def compare_anc_result_with_and_without_filter(x: np.ndarray,
                                                  S_z: np.ndarray,
                                                  original_fs: int, 
                                                  target_fs: int, w_fir: np.ndarray, 
-                                                 filter_sos: np.ndarray):
+                                                 filter: FIRFilter):
     """
     比較濾波in-band與full-band的 ANC 模擬結果w_fir，並繪製功率譜密度 (PSD) 與降噪深度。
     use scipy.signal.lfilter for filtering, to avoid phase distortion like scipy.signal.filtfilt.
@@ -963,8 +963,8 @@ def compare_anc_result_with_and_without_filter(x: np.ndarray,
     attenuation_db = 10 * np.log10(d_power / e_power) if e_power > 0 else float('inf')
 
     # 帶內能量評估
-    d_eval_inband = signal.sosfiltfilt(filter_sos, d_resample[-eval_length:])
-    e_eval_inband = signal.sosfiltfilt(filter_sos, e_test[-eval_length:])
+    d_eval_inband = filter.filter_zero_phase(d_resample[:-eval_length])
+    e_eval_inband = filter.filter_zero_phase(e_test[:-eval_length])
     
     d_power_inband = np.mean(d_eval_inband**2)
     e_power_inband = np.mean(e_eval_inband**2)
@@ -1342,11 +1342,11 @@ if __name__ == "__main__":
     #F_z = load_rew_ir_and_denoise("R Aug 3 feedback path.txt", target_taps=2048, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
     F_z = np.zeros(2048)  # 假設 F(z) 為零，因測試時ANC off 沒有輸出
     S_z = load_rew_ir_and_denoise("R Aug 3 secondary path.txt", target_taps=s_len, pre_peak_margin=20, taper_ratio=0.1, visualize=False)
-    fir = FIRFilter(cutoff=[300, 4000], pass_zero='bandpass', fs=fs)
-    x_resample, d_resample, S_z_resample, F_z_resample = filter_and_resampling(x, d, S_z, F_z, original_fs=fs, target_fs=dsp_fs, filter=fir)
+    fir_fs = FIRFilter(cutoff=[300, 4000], pass_zero='bandpass', fs=fs)
+    x_resample, d_resample, S_z_resample, F_z_resample = filter_and_resampling(x, d, S_z, F_z, original_fs=fs, target_fs=dsp_fs, filter=fir_fs)
     e, y, w_fir, x_net = run_fxnlms(x_resample, d_resample, S_z_resample, S_z_resample[:s_len], F_z_resample, mu=0.007, filter_length=flen, leak=0.0)
-    sos_48000 = signal.butter(N=4, Wn=[300, 4000], btype='bandpass', fs=dsp_fs, output='sos')
-    compare_anc_result_with_and_without_filter(x, d, S_z_resample, original_fs=fs, target_fs=dsp_fs, w_fir=w_fir, filter_sos=sos_48000)
+    fir_dsp_fs = FIRFilter(cutoff=[300, 4000], pass_zero='bandpass', fs= dsp_fs)
+    compare_anc_result_with_and_without_filter(x, d, S_z_resample, original_fs=fs, target_fs=dsp_fs, w_fir=w_fir, filter=fir_dsp_fs)
     # 繪製結果
     #plot_time_domain_residual_comparison(d_resample, e, fs=dsp_fs)
     #plot_psd_comparison(d_resample, e, fs=dsp_fs, nfft=8192)
