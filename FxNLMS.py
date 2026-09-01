@@ -744,18 +744,18 @@ def plot_psd_comparison(d: np.ndarray, e: np.ndarray, fs: int = 48000, nfft: int
                         visualize: bool = True):
     """
     計算並繪製原始誤差 d(n) 與殘留誤差 e(n) 的功率譜密度 (PSD)。
-    用以觀察 FxNLMS 在特定頻率 (窄頻) 上的真實降噪深度。
-    標記關注的特定頻率點 (例如 100Hz, 200Hz, 500Hz, 1kHz, 2kHz) 的降噪深度。
+    用以觀察 FxNLMS / Biquad ANC 在特定頻率 (窄頻) 上的真實降噪深度。
+    自動於指定頻率點 (frequencies_to_mark) 附近搜尋局部峰值並標註降噪量。
     
     Args:
         d (np.ndarray): ANC Off 時的誤差麥克風訊號 (原始噪音)
-        e (np.ndarray): ANC On 且 FxNLMS 收斂後的殘留誤差
+        e (np.ndarray): ANC On 且收斂後的殘留誤差
         fs (int): 取樣率
-        nfft (int): FFT 點數 (越高頻率解析度越好，建議 8192)
-        frequencies_to_mark (list): 要標記的頻率點列表
+        nfft (int): FFT 點數 (建議 8192)
+        frequencies_to_mark (list): 要標記的目標頻率點列表 (Hz)
         visualize (bool): 是否顯示圖形
     """
-    # 確保訊號長度一致，並取最後一半的資料 (確保 FxNLMS 已經達到穩態收斂)
+    # 確保訊號長度一致，並取最後一半的資料 (確保已達到穩態收斂)
     min_len = min(len(d), len(e))
     half_idx = min_len // 2
     d_steady = d[half_idx:min_len]
@@ -766,16 +766,31 @@ def plot_psd_comparison(d: np.ndarray, e: np.ndarray, fs: int = 48000, nfft: int
     f_e, pxx_e = signal.welch(e_steady, fs=fs, window='hann', nperseg=nfft)
 
     # 轉換為 dB 刻度 (10 * log10)
-    # 加上 epsilon 避免 log(0)
     eps = 1e-12
     pxx_d_db = 10 * np.log10(pxx_d + eps)
     pxx_e_db = 10 * np.log10(pxx_e + eps)
 
     # 計算各頻率點的實際降噪深度 (Attenuation = d_dB - e_dB)
     attenuation = pxx_d_db - pxx_e_db
+
+    # 搜尋指定頻率附近的局部峰值 (Local Peak) 並計算降噪量
+    marked_info = []
     for freq in frequencies_to_mark:
-        idx = np.argmin(np.abs(f_d - freq))
-        print(f"Frequency: {f_d[idx]:.1f} Hz, Attenuation: {attenuation[idx]:.2f} dB")
+        # 動態搜尋半徑 (預設 +-5% 或至少 +-25Hz)
+        search_range = max(15.0, freq * 0.05)
+        search_idx = np.where((f_d >= freq - search_range) & (f_d <= freq + search_range))[0]
+        
+        if len(search_idx) > 0:
+            # 於原始噪音 d(n) 之 PSD 中找出局部能量峰值點
+            peak_local_idx = np.argmax(pxx_d_db[search_idx])
+            idx = search_idx[peak_local_idx]
+        else:
+            idx = np.argmin(np.abs(f_d - freq))
+            
+        actual_freq = f_d[idx]
+        att_val = attenuation[idx]
+        marked_info.append((freq, actual_freq, att_val))
+        print(f"Target: {freq} Hz -> Local Peak: {actual_freq:.1f} Hz, Attenuation: {att_val:+.2f} dB")
 
     if visualize:
         # 繪圖
@@ -792,7 +807,17 @@ def plot_psd_comparison(d: np.ndarray, e: np.ndarray, fs: int = 48000, nfft: int
         ax1.grid(True, which="minor", ls="--", alpha=0.3)
         ax1.set_xlim([20, 20000])
 
-        # 下半部：各頻帶降噪深度
+        # 在上半部圖下方空白區加入文字標註 (頻率與降噪深度)
+        if marked_info:
+            text_lines = ["Narrowband Attenuation:"]
+            for target_f, peak_f, att_v in marked_info:
+                text_lines.append(f"  {peak_f:.1f} Hz: {att_v:+.2f} dB (Target: {target_f} Hz)")
+            mark_text_box = "\n".join(text_lines)
+            ax1.text(0.02, 0.05, mark_text_box, transform=ax1.transAxes,
+                     fontsize=9, verticalalignment='bottom', horizontalalignment='left',
+                     bbox=dict(boxstyle='round,pad=0.5', facecolor='white', edgecolor='#cccccc', alpha=0.85))
+
+        # 下半部：各頻帶降噪深度 (維持原樣)
         # 將低於 0 dB (噪音放大) 的部分填色警告
         ax2.semilogx(f_d, attenuation, label='Attenuation (dB)', color='green')
         ax2.fill_between(f_d, attenuation, 0, where=(attenuation >= 0), color='green', alpha=0.3, label='Noise Reduced')
@@ -1217,7 +1242,7 @@ def plot_delay_sweep_analysis(delays: list, nr_band_list: list, nr_overall_list:
     
     # 標記最佳延遲點
     best_time_ms = best_delay / fs * 1000.0
-    ax.scatter([best_delay], [best_nr_band], color='red', s=120, zorder=5, 
+    ax.scatter([best_delay], [best_nr_band], color='red', s=60, zorder=5, 
                label=f'Optimal Delay: {best_delay} samples ({best_time_ms:.3f} ms) -> {best_nr_band:+.2f} dB')
     ax.axvline(x=best_delay, color='red', linestyle=':', alpha=0.6)
     
@@ -1493,5 +1518,5 @@ if __name__ == "__main__":
     # 繪製結果
     #plot_time_domain_residual_comparison(d_resample, e, fs=dsp_fs)
     #plot_psd_comparison(d_resample, e, fs=dsp_fs, nfft=8192)
-    sos_matrix = parse_rew_text_and_convert("REW_500hz_4000hz_biquad_100_duty.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
-    simulate_biquad_anc(x_resample, d_resample, S_z_resample, sos_matrix, fs=dsp_fs, delay_samples=range(0, 40), eval_cutoff=[500, 4000], frequencies_to_mark=[600, 3600])
+    sos_matrix = parse_rew_text_and_convert("REW_100hz_4000hz_biquad_100_duty_0827_1031.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
+    simulate_biquad_anc(x_resample, d_resample, S_z_resample, sos_matrix, fs=dsp_fs, delay_samples=range(0, 40), eval_cutoff=[100, 4000], frequencies_to_mark=[600, 3600])
