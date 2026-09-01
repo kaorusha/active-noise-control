@@ -1207,11 +1207,75 @@ def parse_rew_text_and_convert(filepath, fs_target=384000, invert_gain=True, pri
             print(f"-A2: {to_5_23_hex(-a2)}  ({-a2:+.8f})\n")
     return np.array(sos_list)
 
-def simulate_biquad_anc(x, d, sec_path, sos_matrix, fs=48000, delay_samples=19,
-                        frequencies_to_mark: list = [],
-                        visualize: bool = True):
+def plot_delay_sweep_analysis(delays: list, nr_band_list: list, nr_overall_list: list, best_delay: int, best_nr_band: float, fs: int = 48000, band_label: str = "100-4000Hz"):
     """
-    模擬 Biquad 串聯 ANC 系統，並計算降噪量與頻譜。
+    繪製 Biquad 前置純延遲 (Delay Samples) 掃描與降噪量 (NR) 關聯分析圖
+    """
+    fig, ax = plt.subplots(figsize=(10, 5))
+    ax.plot(delays, nr_band_list, 'g.-', label=f'In-Band NR ({band_label})', linewidth=1.8, markersize=8)
+    ax.plot(delays, nr_overall_list, 'b.--', label='Overall NR', alpha=0.7, linewidth=1.2, markersize=5)
+    
+    # 標記最佳延遲點
+    best_time_ms = best_delay / fs * 1000.0
+    ax.scatter([best_delay], [best_nr_band], color='red', s=120, zorder=5, 
+               label=f'Optimal Delay: {best_delay} samples ({best_time_ms:.3f} ms) -> {best_nr_band:+.2f} dB')
+    ax.axvline(x=best_delay, color='red', linestyle=':', alpha=0.6)
+    
+    ax.set_title(f'Biquad ANC Delay Sweep Analysis (Sampling Rate: {fs} Hz)\n[x(n) -> Delay z^(-D) -> Biquad SOS -> Secondary Path S(z)]')
+    ax.set_xlabel('Delay (Samples)')
+    ax.set_ylabel('Noise Reduction (dB)')
+    ax.grid(True, which='both', ls=':', alpha=0.6)
+    ax.legend(loc='best')
+    
+    # 增加上方 X 軸顯示對應時間 (ms)
+    sec_ax = ax.secondary_xaxis('top', functions=(lambda s: s / fs * 1000.0, lambda ms: ms / 1000.0 * fs))
+    sec_ax.set_xlabel('Delay Time (ms)')
+    
+    plt.tight_layout()
+    plt.show()
+
+def simulate_biquad_anc(x: np.ndarray, 
+                        d: np.ndarray, 
+                        sec_path: np.ndarray, 
+                        sos_matrix: np.ndarray, 
+                        fs: int = 48000, 
+                        delay_samples: int | list | range | np.ndarray = None,
+                        eval_filter: FIRFilter = None,
+                        eval_cutoff: float | list = [100, 4000],
+                        frequencies_to_mark: list = [],
+                        visualize: bool = True) -> tuple:
+    """
+    模擬 Biquad 串聯 ANC 系統，測試並確認最佳的延遲樣本數 (Delay Samples)。
+
+    【物理意義與訊號鏈架構】:
+    - REW 透過等化器擬合出的 Biquad PEQ (sos_matrix) 屬於最小相位 (Minimum Phase) 濾波器，
+      其剝離了聲學傳播與硬體的純延遲 (Pure Transport Delay)。
+    - 在實際 DSP 硬體 (如 ADAU1787 FastDSP) 與模擬中，必須在 sos_matrix 前方串聯一個純延遲模組 z^(-D):
+      x(n) ---> [ Delay z^(-D) ] ---> [ Biquad PEQ: W_min(z) ] ---> y(n) ---> [ S(z) ] ---> y_sec(n)
+      殘差: e(n) = d(n) - y_sec(n) (或同相 + y_sec(n))
+    - 本函式可輸入單一延遲測試，亦可傳入範圍 (如 range(0, 50) 或 None) 自動掃描尋求降噪深度最大之最佳 delay。
+
+    Args:
+        x (np.ndarray): 參考麥克風訊號 x(n)
+        d (np.ndarray): 誤差麥克風原始噪音訊號 d(n)
+        sec_path (np.ndarray): 次級路徑脈衝響應 S(z)
+        sos_matrix (np.ndarray): REW 產生的最小相位 Biquad SOS 矩陣
+        fs (int): 取樣頻率 (Hz)
+        delay_samples (int | list | range | np.ndarray | None):
+            - 若為單一 int: 直接以此固定 delay 進行閉迴路模擬。
+            - 若為 list / range: 掃描測試範圍內所有 delay，找出最佳配置。
+            - 若為 None: 自動掃描預設範圍 range(0, 64)。
+        eval_filter (FIRFilter | None): 用於評估帶內降噪量的零相位 FIRFilter 物件；若為 None 則自動依 eval_cutoff 建立。
+        eval_cutoff (float | list): 帶內評估頻率範圍 (Hz)，例如 [300, 4000] 或 [100, 4000]。
+        frequencies_to_mark (list): 在 PSD 圖上重點標記的頻率點 (Hz)
+        visualize (bool): 是否顯示圖形 (包含 Delay-NR 掃描圖、PSD 頻譜圖與時域殘差波形)
+
+    Returns:
+        tuple: (best_delay, best_nr_band, best_nr_overall, e_best)
+            - best_delay (int): 降噪效果最佳的延遲點數 (samples)
+            - best_nr_band (float): 最佳有效帶限降噪量 (dB)
+            - best_nr_overall (float): 最佳全頻段降噪量 (dB)
+            - e_best (np.ndarray): 最佳延遲配置下對應的殘差訊號 e(n)
     """
     # 確保資料為 1D 浮點數且長度一致
     x = np.nan_to_num(x.flatten()).astype(np.float64)
@@ -1220,59 +1284,138 @@ def simulate_biquad_anc(x, d, sec_path, sos_matrix, fs=48000, delay_samples=19,
     min_len = min(len(x), len(d))
     x, d = x[:min_len], d[:min_len]
 
+    # 解析 delay_samples 輸入參數
+    if delay_samples is None:
+        delay_list = list(range(0, 64))
+        is_sweep = True
+    elif isinstance(delay_samples, (list, range, np.ndarray, tuple)):
+        delay_list = list(delay_samples)
+        is_sweep = len(delay_list) > 1
+    elif isinstance(delay_samples, (int, np.integer)):
+        delay_list = [int(delay_samples)]
+        is_sweep = False
+    else:
+        raise ValueError(f"不支援的 delay_samples 型別: {type(delay_samples)}")
+
     # ==========================================
-    # 執行閉迴路訊號鏈過濾
+    # 初始化評估用帶內濾波器 (採用零相位 FIR 以獲得最高精度無相位失真)
     # ==========================================
-    # 步驟 A: 空間純延遲補償
-    x_del = np.zeros_like(x)
-    if delay_samples < len(x):
-        x_del[delay_samples:] = x[:-delay_samples]
+    if eval_filter is None:
+        pass_zero = 'bandpass' if isinstance(eval_cutoff, (list, tuple)) and len(eval_cutoff) == 2 else 'lowpass'
+        eval_filter = FIRFilter(cutoff=eval_cutoff, pass_zero=pass_zero, numtaps=201, fs=fs)
 
-    # 步驟 B: 通過 Biquad 串聯
-    y = signal.sosfilt(sos_matrix, x_del)
+    if isinstance(eval_filter.cutoff, (list, tuple)):
+        band_str = f"{eval_filter.cutoff[0]}-{eval_filter.cutoff[1]}Hz"
+    else:
+        band_str = f"{eval_filter.cutoff}Hz"
 
-    # 步驟 C: 通過次級路徑 S(z)
-    y_sec = signal.lfilter(sec_path, 1, y)
-
-    # 步驟 D: 殘差計算 (自動偵測正反相極性)
-    e_opt1 = d - y_sec
-    e_opt2 = d + y_sec
+    # ==========================================
+    # 執行閉迴路訊號鏈過濾 (利用 LTI 特性預先計算基底響應以大幅提速)
+    # 訊號鏈: x(n) -> Delay(D) -> Biquad(sos) -> S(z) 等價於 [x(n) -> Biquad(sos) -> S(z)] -> Delay(D)
+    # ==========================================
+    y_base = signal.sosfilt(sos_matrix, x)
+    y_sec_base = signal.lfilter(sec_path, 1, y_base)
 
     # 略過前 0.2 秒暫態建立期
     eval_start = int(0.2 * fs)
+    d_bp = eval_filter.filter_zero_phase(d)
     p_d = np.mean(d[eval_start:]**2)
-    p_e1 = np.mean(e_opt1[eval_start:]**2)
-    p_e2 = np.mean(e_opt2[eval_start:]**2)
-
-    if p_e1 <= p_e2:
-        e = e_opt1
-        polarity_str = "d(n) - y_sec(n) [標準反相]"
-    else:
-        e = e_opt2
-        polarity_str = "d(n) + y_sec(n) [同相疊加]"
-
-    # ==========================================
-    # 降噪量 (NR) 與頻譜計算
-    # ==========================================
-    # 全頻段降噪量
-    p_e = np.mean(e[eval_start:]**2)
-    nr_overall = 10 * np.log10(p_d / (p_e + 1e-12))
-
-    # 帶限降噪量 (100 ~ 4000 Hz)
-    sos_bp = signal.butter(4, [100, 4000], btype='bandpass', fs=fs, output='sos')
-    d_bp = signal.sosfilt(sos_bp, d)
-    e_bp = signal.sosfilt(sos_bp, e)
     p_d_bp = np.mean(d_bp[eval_start:]**2)
-    p_e_bp = np.mean(e_bp[eval_start:]**2)
-    nr_band = 10 * np.log10(p_d_bp / (p_e_bp + 1e-12))
 
-    print("\n==========================================")
-    print(f"極性判定方式: {polarity_str}")
-    print(f"全頻段降噪量 (Overall NR): {nr_overall:+.2f} dB")
-    print(f"有效帶限降噪量 (100-4000Hz): {nr_band:+.2f} dB")
-    print("==========================================\n")
-    plot_psd_comparison(d, e, fs=fs, frequencies_to_mark=frequencies_to_mark, visualize=visualize)
-    plot_time_domain_residual_comparison(d, e, fs=fs)
+    sweep_results = []
+
+    for D in delay_list:
+        # 在前端串聯純延遲: x_del(n) = x(n - D)
+        y_sec_del = np.zeros_like(y_sec_base)
+        if D == 0:
+            y_sec_del = y_sec_base
+        elif D < len(y_sec_base):
+            y_sec_del[D:] = y_sec_base[:-D]
+
+        # 殘差計算 (自動偵測反相抵消或同相疊加)
+        e_opt1 = d - y_sec_del
+        e_opt2 = d + y_sec_del
+        p_e1 = np.mean(e_opt1[eval_start:]**2)
+        p_e2 = np.mean(e_opt2[eval_start:]**2)
+
+        if p_e1 <= p_e2:
+            e_cand = e_opt1
+            pol = "d(n) - y_sec(n) [標準反相]"
+            p_e = p_e1
+        else:
+            e_cand = e_opt2
+            pol = "d(n) + y_sec(n) [同相疊加]"
+            p_e = p_e2
+
+        nr_overall = 10 * np.log10(p_d / (p_e + 1e-12))
+
+        # 使用零相位 FIR 計算帶限降噪量
+        e_cand_bp = eval_filter.filter_zero_phase(e_cand)
+        p_e_bp = np.mean(e_cand_bp[eval_start:]**2)
+        nr_band = 10 * np.log10(p_d_bp / (p_e_bp + 1e-12))
+
+        sweep_results.append({
+            'delay': D,
+            'nr_band': nr_band,
+            'nr_overall': nr_overall,
+            'polarity': pol,
+            'e': e_cand
+        })
+
+    # 尋找最佳延遲點 (以目標頻段帶限降噪深度為主要依據)
+    best_result = max(sweep_results, key=lambda res: res['nr_band'])
+    best_delay = best_result['delay']
+    best_nr_band = best_result['nr_band']
+    best_nr_overall = best_result['nr_overall']
+    e_best = best_result['e']
+    best_polarity = best_result['polarity']
+
+    # ==========================================
+    # 輸出分析報告
+    # ==========================================
+    if is_sweep:
+        print("\n=========================================================================")
+        print(f"--- Biquad ANC 前置 Delay 掃描分析 (共測試 {len(delay_list)} 組延遲配置) ---")
+        print(f"【評估頻段】:     {band_str} (使用零相位 FIR 濾波器)")
+        print(f"【最佳前置延遲】: {best_delay} samples ({best_delay/fs*1000.0:.3f} ms / {best_delay/fs*1e6:.1f} us)")
+        print(f"極性判定方式:     {best_polarity}")
+        print(f"最佳有效帶限降噪: {best_nr_band:+.2f} dB ({band_str})")
+        print(f"最佳全頻段降噪:   {best_nr_overall:+.2f} dB")
+        
+        # 若有包含 Delay=0，計算相比於無延遲 (Delay=0) 帶來的性能提升
+        zero_res = next((item for item in sweep_results if item['delay'] == 0), None)
+        if zero_res is not None and best_delay != 0:
+            diff_band = best_nr_band - zero_res['nr_band']
+            print(f"相較於未加 Delay (0 sample): 帶限降噪改善了 {diff_band:+.2f} dB (從 {zero_res['nr_band']:+.2f} dB 提升至 {best_nr_band:+.2f} dB)")
+        
+        print("-------------------------------------------------------------------------")
+        print("Top 5 最佳 Delay 候選排行:")
+        top5 = sorted(sweep_results, key=lambda res: res['nr_band'], reverse=True)[:min(5, len(sweep_results))]
+        for rank, item in enumerate(top5, 1):
+            print(f"  #{rank}: Delay={item['delay']:2d} samples ({item['delay']/fs*1000.0:6.3f} ms) | 帶限 NR: {item['nr_band']:+6.2f} dB | 全頻 NR: {item['nr_overall']:+6.2f} dB")
+        print("=========================================================================\n")
+    else:
+        print("\n==========================================")
+        print(f"前置延遲配置: {best_delay} samples ({best_delay/fs*1000.0:.3f} ms / {best_delay/fs*1e6:.1f} us)")
+        print(f"極性判定方式: {best_polarity}")
+        print(f"全頻段降噪量 (Overall NR): {best_nr_overall:+.2f} dB")
+        print(f"有效帶限降噪量 ({band_str}): {best_nr_band:+.2f} dB")
+        print("==========================================\n")
+
+    # ==========================================
+    # 圖形視覺化
+    # ==========================================
+    if is_sweep and visualize:
+        delays = [item['delay'] for item in sweep_results]
+        nr_band_list = [item['nr_band'] for item in sweep_results]
+        nr_overall_list = [item['nr_overall'] for item in sweep_results]
+        plot_delay_sweep_analysis(delays, nr_band_list, nr_overall_list, best_delay, best_nr_band, fs=fs, band_label=band_str)
+
+    if visualize:
+        plot_psd_comparison(d, e_best, fs=fs, frequencies_to_mark=frequencies_to_mark, visualize=visualize)
+        plot_time_domain_residual_comparison(d, e_best, fs=fs)
+
+    return best_delay, best_nr_band, best_nr_overall, e_best
 
 def plot_bode_diagram(filter_data: np.ndarray|tuple, fs=48000, title="Filter Bode Diagram"):
     """
@@ -1350,5 +1493,5 @@ if __name__ == "__main__":
     # 繪製結果
     #plot_time_domain_residual_comparison(d_resample, e, fs=dsp_fs)
     #plot_psd_comparison(d_resample, e, fs=dsp_fs, nfft=8192)
-    sos_matrix = parse_rew_text_and_convert("REW_300hz_4000hz_biquad_100_duty_0827_1045.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
-    simulate_biquad_anc(x_resample, d_resample, S_z_resample, sos_matrix, fs=dsp_fs, delay_samples=19, frequencies_to_mark=[600, 3600])
+    sos_matrix = parse_rew_text_and_convert("REW_500hz_4000hz_biquad_100_duty.txt", fs_target=dsp_fs, invert_gain=True, print_enabled=False)
+    simulate_biquad_anc(x_resample, d_resample, S_z_resample, sos_matrix, fs=dsp_fs, delay_samples=range(0, 40), eval_cutoff=[500, 4000], frequencies_to_mark=[600, 3600])
